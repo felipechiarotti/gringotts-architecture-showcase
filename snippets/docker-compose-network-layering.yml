@@ -1,0 +1,34 @@
+# Illustrative excerpt — real port/network shape from the three compose files, trimmed to
+# just the security-relevant parts (env values, container names, volumes omitted).
+
+# ── docker-compose.yml (base): NO service publishes a host port ─────────────────────────
+services:
+  api:
+    build: { context: ., dockerfile: src/Gringotts.Api/Dockerfile }
+    networks: [gringotts_net]
+  postgres:
+    image: postgres:16-alpine
+    networks: [gringotts_net]
+  redis:
+    image: redis:7-alpine
+    networks: [gringotts_net]
+  seq:
+    image: datalust/seq:latest
+    networks: [gringotts_net]
+
+# ── docker-compose.override.yml: the ONLY file that binds any port to a host interface ──
+# Every binding uses 127.0.0.1 or a BIND_IP variable — never 0.0.0.0.
+#   api:      127.0.0.1:15080 -> 8080
+#   postgres: ${BIND_IP}:15432 -> 5432
+#   redis:    ${BIND_IP}:15379 -> 6379
+#   seq:      ${BIND_IP}:15081 -> 80   (UI)
+#             ${BIND_IP}:15341 -> 5341 (ingest)
+
+# ── docker-compose.prod.yml: swaps the API for the built image, adds monitoring ─────────
+# Same BIND_IP-gated pattern extends to the uptime dashboard:
+#   uptime-kuma: ${BIND_IP}:15082 -> 3001
+
+# In production, BIND_IP = the VPS's Tailscale IP. Result: Postgres, Redis, Seq, and the
+# monitoring dashboard are reachable only from inside the Tailscale mesh — never from the
+# public internet. Nginx (outside Docker, on the host) is the only public entry point,
+# terminating Cloudflare Origin CA certs behind Cloudflare's proxy/WAF/DDoS layer.
