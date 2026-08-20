@@ -193,6 +193,78 @@ just if it fails outright.
 - **Non-root containers** — the API image runs as a non-root user on a minimal, security-patched base
   image.
 
+### 7. Cloudflare as a second, edge-level security layer
+
+Nginx + the app's own auth aren't the only line of defense — Cloudflare sits in front of all public
+traffic with its own independent set of controls, so a bypass of one layer still has to clear the other:
+
+- **TLS 1.3 minimum**, Opportunistic Encryption and Automatic HTTPS Rewrites — refuses anything below
+  TLS 1.3, and makes sure no request/asset ever silently falls back to plaintext HTTP.
+- **Origin Certificate** (Cloudflare-issued, trusted only by Cloudflare) installed on Nginx — the
+  Cloudflare↔origin hop is encrypted too, not just the public-facing edge.
+- **Client certificates (mTLS): intentionally off.** Auth is handled at the application layer (JWT +
+  2FA); mTLS would add operational overhead (cert distribution/rotation) without a matching threat model
+  for a single-user personal app.
+- **Edge rate limiting on `/login`** (5 requests / 10 seconds → block) as a coarser, network-level
+  backstop *in front of* the app's own PIN-based rate limiter — the DB/app never even sees a login flood
+  past that threshold.
+- **Custom edge rules**: `Only HTTPS` and `Only HTTP/2-3` block any request that isn't modern
+  encrypted traffic (the profile of almost all bot/scanner traffic); an `IPs blocked` rule denies a
+  manually curated blocklist; `Block Non-BR Traffic` challenges/blocks requests from outside Brazil,
+  since the app has no legitimate users outside the country — this alone removes most opportunistic
+  internet-wide scanning before it reaches the origin at all.
+
+The result: an attacker has to get through Cloudflare's edge rules *and* Nginx/Tailscale network
+isolation *and* the app's own auth/IDOR checks — none of which alone is the single point of failure.
+
+---
+
+## Performance decisions
+
+The app runs on a deliberately small VPS — **2 vCPU / 2GB RAM**, chosen over a cheaper 1 vCPU box
+specifically because a single vCPU serializes every concurrent DB call/query behind one core, which
+would show up as request queuing under load. With 2 vCPUs, one core can be doing DB I/O while the other
+keeps serving requests. Query and index design then does the rest: in practice the app comfortably
+handles **~3,000 requests/second** on that box.
+
+**Indexes built around the actual query shapes, not "index everything":**
+
+```csharp
+// TransactionConfiguration.cs — composite indexes match how the dashboard/forecast actually filter
+builder.HasIndex(t => new { t.UserId, t.Date });
+builder.HasIndex(t => new { t.UserId, t.Status });
+builder.HasIndex(t => new { t.UserId, t.SubCategoryId });
+
+// Filtered/partial indexes keep the index small by excluding the common "soft-deleted" case
+builder.HasIndex(u => u.Email).IsUnique().HasFilter("\"IsDeleted\" = false");
+```
+A later migration explicitly *dropped* single-column `IsDeleted` indexes in favor of these composite
+ones — a deliberate correction once the real query patterns were clear, not a first-try guess.
+
+**Query patterns that keep memory and round-trips low:**
+- `.AsNoTracking()` on every read-only query (no change-tracker overhead for data that's never saved
+  back).
+- `.AsSplitQuery()` on multi-`Include()` queries (e.g. transactions + tags) to avoid a join-driven
+  Cartesian product blowing up row counts.
+- `ExecuteUpdateAsync(...)` for bulk field changes (e.g. re-assigning a category on many transactions)
+  — one SQL `UPDATE`, never a load-mutate-save loop.
+- `.Select(...)` projections for lookups that only need a couple of fields (e.g. checking which
+  months already have generated transactions), instead of materializing full entities.
+- Hard `.Take(limit)` caps on search endpoints, so a broad query can't return unbounded rows.
+
+**Background jobs batch instead of looping DB calls:** the recurring-transaction generator collects all
+transactions to create in memory across every active template, then calls `SaveChangesAsync()` **once**
+per run — one round trip regardless of how many templates/users are processed — and skips
+already-generated months via an in-memory lookup instead of re-querying per month.
+
+**Resource tuning matched to the 2 vCPU box:** Hangfire is configured with a single worker
+(`WorkerCount = 1`) and a 5-minute schedule-polling interval, so the background processor doesn't
+compete with request-handling threads for CPU; Npgsql's connection pooling is left at sensible defaults
+rather than over-provisioned. Redis is wired up but deliberately *not* used on the hot request path —
+the dashboard/transaction data is time-sensitive enough that cache invalidation would cost more than the
+read it saves, so the design keeps the request path simple (indexed DB read) instead of adding caching
+complexity where it wouldn't pay off.
+
 ---
 
 ## Why this repo exists
