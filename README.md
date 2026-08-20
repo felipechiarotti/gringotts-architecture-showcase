@@ -50,6 +50,126 @@ codebase.
 
 ---
 
+## Code &amp; structural decisions
+
+### Entities: factory methods + intention-revealing behavior, not public setters
+
+```csharp
+// snippets/TransactionEntity.cs (trimmed)
+public class Transaction : BaseEntity, ISoftDeletable
+{
+    public Guid UserId { get; private set; }
+    public TransactionStatus Status { get; private set; }
+    // ...all setters are private...
+
+    public static Transaction Create(Guid userId, Guid subCategoryId, Guid paymentMethodId,
+        TransactionType type, TransactionStatus status, decimal amount, string description,
+        DateOnly date /* ... */) => new() { UserId = userId, /* ... */ };
+
+    public void ConfirmPayment() => Status = TransactionStatus.Paid;
+    public void MarkOverdue() => Status = TransactionStatus.Overdue;
+}
+```
+
+No handler ever writes `transaction.Status = TransactionStatus.Paid` directly — it calls
+`ConfirmPayment()`. The difference matters once there's more than one field to keep consistent when a
+status changes: the invariant lives in one named method instead of being re-implemented (or forgotten)
+at every call site.
+
+### Soft delete: one interceptor, not a convention everyone has to remember
+
+```csharp
+// snippets/AppDbContext-SoftDelete.cs
+public override async Task<int> SaveChangesAsync(CancellationToken ct = default)
+{
+    var softDeletableEntries = ChangeTracker.Entries<ISoftDeletable>()
+        .Where(e => e.State == EntityState.Deleted);
+
+    foreach (var entry in softDeletableEntries)
+    {
+        entry.Property(e => e.IsDeleted).CurrentValue = true;
+        entry.State = EntityState.Modified;   // turn the DELETE into an UPDATE
+    }
+
+    return await base.SaveChangesAsync(ct);
+}
+```
+
+A handler just calls `repository.Delete(entity)` like it would for a real delete — this interceptor
+transparently rewrites it into `IsDeleted = true` before it reaches Postgres. Combined with the global
+`HasQueryFilter(e => !e.IsDeleted)` on every entity, "soft delete" isn't a rule every new feature has to
+remember; it's structurally impossible to get wrong.
+
+### CQRS pipeline behaviors: validation and logging run once, not per-handler
+
+```csharp
+// snippets/ValidationBehavior.cs
+public class ValidationBehavior<TRequest, TResponse>(IEnumerable<IValidator<TRequest>> validators)
+    : IPipelineBehavior<TRequest, TResponse> where TRequest : notnull
+{
+    public async Task<TResponse> Handle(TRequest request, RequestHandlerDelegate<TResponse> next, CancellationToken ct)
+    {
+        var failures = validators.Select(v => v.Validate(new ValidationContext<TRequest>(request)))
+            .SelectMany(r => r.Errors).ToList();
+
+        if (failures.Count != 0) throw new ValidationException(failures);
+        return await next(ct);
+    }
+}
+```
+
+Every `Command`/`Query` gets FluentValidation and structured request/response logging for free via the
+MediatR pipeline — a handler is never responsible for calling its own validator or wrapping itself in a
+try/log/catch. Adding a new feature can't accidentally skip validation because there's nowhere to skip
+it from.
+
+### One place translates exceptions into HTTP, not every endpoint
+
+```csharp
+// snippets/GlobalExceptionHandler.cs (trimmed)
+var problemDetails = exception switch
+{
+    ValidationException ve   => new ProblemDetails { Status = 400, Title = "Validation Error", /* field errors */ },
+    NotFoundException        => new ProblemDetails { Status = 404, Title = "Not Found" },
+    ConflictException        => new ProblemDetails { Status = 409, Title = "Conflict" },
+    UnauthorizedException    => new ProblemDetails { Status = 401, Title = "Unauthorized" },
+    BadRequestException      => new ProblemDetails { Status = 400, Title = "Bad Request" },
+    _                        => new ProblemDetails { Status = 500, Title = "Internal Error" }
+};
+```
+
+Handlers and domain code throw plain, meaningful exceptions (`NotFoundException`, `UnauthorizedException`,
+...) with no knowledge of HTTP at all. A single `IExceptionHandler` at the API boundary is the only place
+that decides what status code and shape the client sees — domain/application code stays testable without
+an `HttpContext` anywhere near it, and every endpoint returns errors in the same consistent shape.
+
+### Minimal API modules instead of controllers
+
+```csharp
+// snippets/TransactionEndpoints.cs (trimmed)
+public static class TransactionEndpoints
+{
+    public static void MapTransactionEndpoints(this IEndpointRouteBuilder app)
+    {
+        var group = app.MapGroup("/api/transactions").WithTags("Transactions");
+
+        group.MapPost("/", async (CreateTransactionCommand command, ISender sender) =>
+        {
+            var id = await sender.Send(command);
+            return Results.Created($"/api/transactions/{id}", null);
+        });
+        // ...MapGet, MapPut, MapPatch, MapDelete — one line each, no controller class
+    }
+}
+```
+
+Each feature area gets one static class with its routes grouped under a common prefix — no controller
+base class, no attribute routing to keep in sync with the route table, and every route handler is a
+one-line MediatR dispatch. Route → `Command`/`Query` → `Handler` is the only path a request can take,
+which is what keeps the CQRS shape actually consistent across 15+ feature areas instead of drifting.
+
+---
+
 ## Security decisions
 
 ### 1. IDOR prevention as a standing rule
@@ -83,6 +203,14 @@ public class DeleteGoalCommandHandler(
 
 The ID in the URL is never trusted on its own — a `NotFoundException`/`UnauthorizedException` fires
 before any data crosses the boundary back to the caller, and existence isn't leaked either way.
+
+### 1.5 Two-factor login: why a password alone wasn't enough
+
+JWT gives stateless API auth, but a bare password is a single point of failure for an app that holds
+real financial data — so login is a two-step flow instead: email + password validates and triggers a
+6-digit PIN sent via email (MailKit/SMTP), and only the PIN exchanges for a JWT. A leaked or guessed
+password alone still isn't enough to get in. The endpoint is rate-limited to 10 requests / 5 minutes per
+IP, specifically to slow down brute-forcing the PIN itself, not just the password.
 
 ### 2. Password hashing: BCrypt + pepper, layered on purpose
 
