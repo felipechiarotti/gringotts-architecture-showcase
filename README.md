@@ -168,6 +168,46 @@ base class, no attribute routing to keep in sync with the route table, and every
 one-line MediatR dispatch. Route → `Command`/`Query` → `Handler` is the only path a request can take,
 which is what keeps the CQRS shape actually consistent across 15+ feature areas instead of drifting.
 
+### Correlation IDs: every response can be traced back to its logs
+
+```csharp
+// snippets/CorrelationIdMiddleware.cs
+public class CorrelationIdMiddleware(RequestDelegate next)
+{
+    private const string CorrelationIdHeader = "X-Correlation-Id";
+
+    public async Task InvokeAsync(HttpContext context)
+    {
+        var correlationId = context.Request.Headers.TryGetValue(CorrelationIdHeader, out var header)
+            ? header.FirstOrDefault()
+            : Guid.NewGuid().ToString();
+
+        context.Response.OnStarting(() =>
+        {
+            context.Response.Headers[CorrelationIdHeader] = correlationId;
+            return Task.CompletedTask;
+        });
+
+        using (LogContext.PushProperty("CorrelationId", correlationId))
+        {
+            await next(context);
+        }
+    }
+}
+```
+
+Every request either brings its own `X-Correlation-Id` (useful when the frontend or an external caller
+wants to tie its own logs to the API's) or gets a fresh GUID generated for it. That ID is pushed into
+Serilog's `LogContext`, so **every log line written anywhere during that request** — across
+controllers/endpoints, MediatR handlers, repositories — carries the same `CorrelationId` property without
+any of that code having to pass it around explicitly.
+
+The response always echoes it back in the same `X-Correlation-Id` header, registered via
+`Response.OnStarting` rather than set directly — that callback fires right before headers are sent
+regardless of whether the request succeeded or blew up through `GlobalExceptionHandler`, so an error
+response still comes back with the same correlation ID as the logs describing what failed. Given an ID
+from a bug report or a failed request, every Seq log line for that exact request is one filter away.
+
 ---
 
 ## Security decisions
